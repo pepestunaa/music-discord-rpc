@@ -2,12 +2,10 @@
 use discord_presence::{models::ActivityType, Client as DiscordClient};
 use lru::LruCache;
 use serde::Deserialize;
+use std::env;
 use std::num::NonZeroUsize;
-use std::{env, time};
-use std::{
-    thread::{self},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use urlencoding::encode;
 use winreg::enums::*;
 use winreg::RegKey;
@@ -17,10 +15,18 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus,
 };
 
+const DEFAULT_CLIENT_ID: u64 = 1511746527125700842;
+const APP_REGISTRY_NAME: &str = "music_discord_rpc";
+// Upgraders from the old ytm_discord_rpc build would otherwise keep a
+// second, dead startup entry forever.
+const LEGACY_REGISTRY_NAME: &str = "ytm_discord_rpc";
+const DEFAULT_ART_URL: &str = "https://c.tenor.com/1gdoP8gQoqoAAAAC/tenor.gif";
+
 #[derive(Debug)]
 struct MediaInfo {
     title: String,
     artist: String,
+    source_app_id: String,
     start_timestamp: u64,
     end_timestamp: u64,
     is_playing: bool,
@@ -44,6 +50,13 @@ fn get_current_media() -> Option<MediaInfo> {
         return None;
     }
 
+    // Identifies which app owns the media session (e.g. Spotify, a browser,
+    // VLC), so the presence can brand itself after the real player.
+    let source_app_id = session
+        .SourceAppUserModelId()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
     let timeline = session.GetTimelineProperties().ok()?;
 
     let position_ticks = timeline.Position().ok()?.Duration;
@@ -66,6 +79,7 @@ fn get_current_media() -> Option<MediaInfo> {
     Some(MediaInfo {
         title,
         artist,
+        source_app_id,
         start_timestamp: now_secs.saturating_sub(real_position_secs),
         end_timestamp: now_secs.saturating_sub(real_position_secs) + duration_secs,
         is_playing,
@@ -87,6 +101,70 @@ fn format_media_str(text: &str) -> String {
     s
 }
 
+struct PlayerInfo {
+    name: String,
+    use_spotify_search: bool,
+}
+
+impl PlayerInfo {
+    fn from_aumid(aumid: &str) -> PlayerInfo {
+        let lower = aumid.to_lowercase();
+        let known: &[(&str, &str, bool)] = &[
+            ("spotify", "Spotify", true),
+            ("ytmusic", "YouTube Music", false),
+            ("youtube", "YouTube Music", false),
+            ("microsoftedge", "Edge", false),
+            ("msedge", "Edge", false),
+            ("chrome", "Chrome", false),
+            ("firefox", "Firefox", false),
+            ("vlc", "VLC", false),
+            ("foobar2000", "foobar2000", false),
+            ("winamp", "Winamp", false),
+            ("aimp", "AIMP", false),
+            ("mediamonkey", "MediaMonkey", false),
+        ];
+        for (needle, name, spotify) in known {
+            if lower.contains(needle) {
+                return PlayerInfo {
+                    name: name.to_string(),
+                    use_spotify_search: *spotify,
+                };
+            }
+        }
+        let name = if aumid.is_empty() {
+            "Music".to_string()
+        } else {
+            // AUMIDs look like "Publisher.AppName-suffix!EntryPoint"; the
+            // last segment is the closest thing to a readable app name.
+            let tail = aumid
+                .rsplit(|c| c == '!' || c == '.')
+                .find(|s| !s.is_empty())
+                .unwrap_or(aumid);
+            capitalize_first(&tail.chars().take(32).collect::<String>())
+        };
+        PlayerInfo {
+            name,
+            use_spotify_search: false,
+        }
+    }
+
+    fn search_url(&self, query: &str) -> String {
+        if self.use_spotify_search {
+            format!("https://open.spotify.com/search/{}", encode(query))
+        } else {
+            format!("https://music.youtube.com/search?q={}", encode(query))
+        }
+    }
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => s.to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 struct ItunesResponse {
     results: Vec<ItunesTrack>,
@@ -106,7 +184,7 @@ fn get_album_art_url(title: &str, artist: &str) -> Option<String> {
     );
 
     let body = ureq::get(&url)
-        .timeout(time::Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
         .call()
         .ok()?
         .into_string()
@@ -127,26 +205,39 @@ fn add_to_startup() {
     let path = r#"Software\Microsoft\Windows\CurrentVersion\Run"#;
 
     if let Ok(key) = hkcu.open_subkey_with_flags(path, KEY_SET_VALUE) {
+        let _ = key.delete_value(LEGACY_REGISTRY_NAME);
         if let Ok(exe_path) = env::current_exe() {
             let exe_path_str = exe_path.to_string_lossy().into_owned();
-            let _ = key.set_value("ytm_discord_rpc", &exe_path_str);
+            let _ = key.set_value(APP_REGISTRY_NAME, &exe_path_str);
         }
     }
 }
 fn main() {
     add_to_startup();
-    let mut drpc = DiscordClient::new(1511746527125700842);
+
+    let client_id = env::var("MUSIC_RPC_CLIENT_ID")
+        .ok()
+        .and_then(|id| id.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CLIENT_ID);
+
+    let mut drpc = DiscordClient::new(client_id);
     drpc.on_ready(|_ctx| {
         println!("Discord Rich Presence Connected!");
     })
     .persist();
     drpc.start();
     println!("Connecting to Discord...");
+    let discord_deadline = Instant::now() + Duration::from_secs(30);
     while !DiscordClient::is_ready() {
+        if Instant::now() >= discord_deadline {
+            println!("Discord is not running; activity updates will retry once it starts.");
+            break;
+        }
         thread::sleep(Duration::from_millis(500));
     }
     let mut current_track = String::new();
     let mut current_start = None;
+    let mut current_source = String::new();
     let mut needs_update = true;
     let mut is_idle = false;
     let mut art_cache: LruCache<String, Option<String>> =
@@ -181,46 +272,36 @@ fn main() {
             needs_update = true;
         }
 
-        if current_track != media.title || current_start != Some(media.start_timestamp) {
+        if current_track != media.title
+            || current_start != Some(media.start_timestamp)
+            || current_source != media.source_app_id
+        {
             println!("Listening: {} - {}", media.title, media.artist);
             current_track = media.title.clone();
             current_start = Some(media.start_timestamp);
+            current_source = media.source_app_id.clone();
             needs_update = true;
         }
         if needs_update {
             let title = format_media_str(&media.title);
             let artist = format_media_str(&media.artist);
+            let player = PlayerInfo::from_aumid(&media.source_app_id);
             let start = media.start_timestamp;
             let end = media.end_timestamp;
-            let search_artist = format!("{}", artist);
-            let search_listen = format!("{} {}", title, artist);
 
             // Fetch album art (with cache)
-            let cache_key = format!("{}|{}", title, artist);
+            let cache_key = format!("{}|{}", media.title, media.artist);
             let thumbnail_url = if let Some(cached) = art_cache.get(&cache_key) {
-                cached
-                    .clone()
-                    .unwrap_or_else(|| "https://c.tenor.com/1gdoP8gQoqoAAAAC/tenor.gif".to_string())
+                cached.clone().unwrap_or_else(|| DEFAULT_ART_URL.to_string())
             } else {
-                // println!("Fetching album art for: {} - {}", title, artist);
-                let art = get_album_art_url(&title, &artist);
+                let art = get_album_art_url(&media.title, &media.artist);
                 art_cache.put(cache_key.clone(), art.clone());
-                // match &art {
-                //     Some(url) => println!("Album art found: {}", url),
-                //     None => println!("No album art found, using default logo"),
-                // }
-                art.unwrap_or_else(|| "https://c.tenor.com/1gdoP8gQoqoAAAAC/tenor.gif".to_string())
+                art.unwrap_or_else(|| DEFAULT_ART_URL.to_string())
             };
 
-            let artist_url = format!(
-                "https://music.youtube.com/search?q={}",
-                encode(&search_artist)
-            );
+            let listen_url = player.search_url(&format!("{} {}", media.title, media.artist));
+            let artist_url = player.search_url(&media.artist);
 
-            let listen_url = format!(
-                "https://music.youtube.com/search?q={}",
-                encode(&search_listen)
-            );
             let res = drpc.set_activity(|act| {
                 act.activity_type(ActivityType::Listening)
                     .details(&title)
@@ -228,7 +309,7 @@ fn main() {
                     .timestamps(|t| t.start(start).end(end))
                     .assets(|a| {
                         a.large_image(&thumbnail_url)
-                            .large_text("YouTube Music")
+                            .large_text(&player.name)
                             .small_image("https://c.tenor.com/I0IYOKVklREAAAAC/tenor.gif")
                             .small_text("Bub")
                     })
@@ -237,16 +318,15 @@ fn main() {
             });
             match res {
                 Ok(_) => {
-                    println!("a");
                     needs_update = false;
+                    // Discord rejects activity updates faster than roughly
+                    // one per 5 seconds.
+                    thread::sleep(Duration::from_secs(5));
                 }
                 Err(e) => {
                     eprintln!("Failed to set activity: {}", e);
                 }
             }
-            thread::sleep(Duration::from_secs(10));
         }
-        println!("b");
-        thread::sleep(Duration::from_secs(10));
     }
 }
